@@ -5,6 +5,15 @@ library(lme4)
 library(car)
 
 theme_set(theme_classic())
+#Define function to give NA if all NAs else give mean
+meanna <- function(x){
+  if(all(is.na(x))){
+    NA
+  }
+  else{
+    mean(x, na.rm = TRUE)
+  }
+}
 
 #====read data====
 inc <- read_csv("data/incubation_core.csv")
@@ -30,6 +39,16 @@ nep <- inc_full %>%
 
 unique(nep$sampledate)
 
+
+resp_avg <- inc_full %>% 
+  filter(sampledate>as.Date("2017-05-24"),
+         dark_light == 0) %>% 
+  group_by(sampledate) %>% 
+  summarise(do_gm2hr = mean(do_gm2hr),
+            wtemp = mean(wtemp)) %>% 
+  mutate(light50 = 0,
+         light_logger = 0) 
+
 rc <- read_csv("data/rc_data.csv")
 
 
@@ -43,14 +62,28 @@ midges <- rc %>%
   filter(sta == 33,
          year(sampledate)>2016)
 
-data <- nep %>% 
-  left_join(midges) %>% 
+
+resp.data.avg <- resp_avg %>% 
+  left_join(midges %>% 
+              group_by(sampledate, instar) %>% 
+              summarise(larvae = meanna(larvae),
+                        ninstar = meanna(ninstar))) %>% 
   filter(!is.na(larvae))
 
+data <- nep %>% 
+  left_join(midges) %>% 
+  filter(!is.na(larvae)) %>% 
+  full_join(resp.data.avg)
+
+
+
+
 data %>% 
-  ggplot(aes(x = light50, y = do_gm2hr, color = log1p(ninstar)))+
+  ggplot(aes(x = light50, y = do_gm2hr, size = ninstar, col = year(sampledate) + yday(sampledate)/365))+
   facet_wrap(~instar)+
-  geom_point()+
+  geom_point(alpha = 0.5)+
+  labs(color = "Date",
+       size = "Larvae")+
   scale_color_viridis_c()
 
 
@@ -76,6 +109,8 @@ mod1 <- lmer(log1p(larvae)~do_gm2hr+(1|sampledate) + (1|year), data = data %>% m
 
 summary(mod1)
 Anova(mod1, test.statistic = "F")
+
+
 
 
 mod1.5 <- data %>%
@@ -106,11 +141,60 @@ data %>%
   labs(color = element_blank())+
   theme(legend.position = "bottom")
 
-mod2 <- lmer(do_gm2hr~log1p(s1)+log1p(s2)+log1p(s3)+log1p(s4) + (1|sampledate), data = datawide) 
+mod2.0 <- lmer(do_gm2hr~log1p(larvae)+(1|sampledate), data = data %>% mutate(sampledate = as.character(sampledate), year= as.character(year(sampledate)))) 
+
+summary(mod2.0)
+Anova(mod2.0, test.statistic = "F")
+
+data %>% 
+  group_by(sampledate) %>%
+  mutate(do_var = do_gm2hr-mean(do_gm2hr)) %>% 
+  ggplot(aes(x = log1p(larvae), y = do_gm2hr))+
+  geom_point()+
+  geom_smooth(method = "lm")
+
+data %>% 
+  group_by(sampledate) %>%
+  mutate(do_var = do_gm2hr-mean(do_gm2hr),
+         larvvar = (larvae-mean(larvae))/mean(larvae)) %>% 
+  ggplot(aes(x = larvvar, y = do_var))+
+  geom_point()+
+  geom_smooth(method = "lm")
+
+
+data %>% 
+  ggplot(aes(x = log1p(ninstar), y = do_gm2hr))+
+  facet_wrap(~instar)+
+  geom_point()+
+  geom_smooth(method = "lm")
+
+datavg <- data %>% 
+  mutate(instar = as.numeric(str_remove(instar,"s")),
+         star = instar*ninstar) %>% 
+  group_by(sampledate, coreid, do_gm2hr, larvae) %>% 
+  summarise(avg_instar = sum((ninstar*instar)/(larvae), na.rm = TRUE))
+
+mod2.3 <- lmer(do_gm2hr~avg_instar*larvae+ (1|sampledate), data = datavg) 
+
+summary(mod2.3)
+
+Anova(mod2.3, test.statistic = "F", type = 3)
+Anova(mod2.3, test.statistic = "F", type = 2)
+
+
+mod2 <- lmer(do_gm2hr~s1+s2+s3+s4 + (1|sampledate), data = datawide) 
 
 summary(mod2)
 
-Anova(mod2)
+Anova(mod2, test.statistic = "F")
+
+
+mod2.1 <- lmer(do_gm2hr~log1p(s1)+log1p(s2)+log1p(s3)+log1p(s4) + (1|sampledate), data = datawide) 
+
+summary(mod2.1)
+
+Anova(mod2.1)
+
 
 data %>% 
   ggplot(aes(y = do_gm2hr, x = log1p(ninstar), color = factor(sampledate)))+
@@ -128,3 +212,93 @@ data %>%
   geom_line(aes(group = sampledate), alpha = 0.2)+
   scale_color_viridis_c()+
   theme(legend.position = "bottom")
+
+
+#====Fit midge P-I model using NLS=====
+dz <- data %>% 
+  # filter(!is.na(coreid)) %>% 
+  select(sampledate, light50, larvae, do_gm2hr) %>% 
+  unique() %>% 
+  mutate(light.z = (light50+1)/ max(light50+1),
+         midge.z = log(larvae+1)/max(log(larvae+1)),
+         nep.z = (do_gm2hr)/ max(do_gm2hr))
+
+
+skimr::skim(dz)
+
+
+mod <- nls(nep.z~( (me*midge.z+ beta)*light.z)/(k + light.z) + (d + med*midge.z),
+    data = dz,
+    start = c( beta = 0.01, k = 0.5, me = 0.1, d = -0.1, med = -0.1),
+    lower = c(0, 0, 0, -50, -50),
+    upper = c(50, 50,50, 0, 50),
+    algorithm = "port")
+
+summary(mod)
+plot(mod)
+
+(coef(mod)["beta"] + coef(mod)["me"])/coef(mod)["k"]
+
+
+(coef(mod)["beta"])/coef(mod)["k"]
+
+
+nd = data.frame(light.z = seq(min(dz$light.z), max(dz$light.z), by = 0.01)) %>% 
+  crossing(midge.z = c(min(dz$midge.z), max(dz$midge.z)))
+nd$nep <- predict(mod, newdata = nd)
+
+nd %>% 
+  ggplot(aes(x = light.z, y = nep,))+
+  geom_line(aes( color = factor(midge.z)))+
+  geom_point(aes(y = nep.z, fill = midge.z), shape= 21, data = dz)+
+  scale_color_viridis_d()+
+  scale_fill_viridis_c()
+
+
+
+mod.nome <- nls(nep.z~( (beta)*light.z)/(k + light.z) + d,
+                data = dz,
+                start = c( beta = 0.01,k = 0.5, d = -0.1),
+                lower = c(0, 0, -50),
+                upper = c(50, 50, 0),
+                algorithm = "port")
+
+summary(mod.nome)
+
+
+nd2 <- data.frame(light.z = seq(min(dz$light.z), max(dz$light.z), by = 0.01), midge.z = "no midge efffect")
+nd2$nep <- predict(mod.nome, newdata = nd2)
+
+ndfull <- full_join(nd %>% mutate(midge.z = ifelse(midge.z == 1, "peak midge", "no midge")), nd2)
+
+ndfull %>% 
+  ggplot(aes(x = light.z, y = nep, ))+
+  geom_point(aes(x = light.z, y = nep.z, fill = midge.z), shape = 21, size = 2, alpha = 0.7, data = dz)+
+  geom_line(aes(color = as.character(midge.z)))+
+  labs(x = "Scaled Light",
+       y = "Scaled NEP",
+       color = element_blank(),
+       fill = "Scaled Midges")+
+  scale_color_viridis_d()+
+  scale_fill_viridis_c()
+
+# ggpreview(plot = last_plot(), width = 5, height = 3, units = "in", dpi = 650)
+
+
+logLik(mod)
+logLik(mod.nome)
+anova(mod, mod.nome)
+AIC(mod, mod.nome)
+
+#====Midge effects on alpha and beta====
+
+
+mod2 <- nls(nep.z~( (me*midge.z+ beta)*light.z)/(((me*midge.z+ beta)/(alpha+mea*midge.z)) + light.z) + (d + med*midge.z),
+           data = dz,
+           start = c( beta = 0.1, alpha = 0.1, mea = 0.01, me = 0.1, d = -0.1, med = -0.1),
+           lower = c(0, 0, 0, 0, -50, -50),
+           upper = c(50, 50,50, 50, 0, 50),
+           algorithm = "port")
+
+summary(mod2)
+plot(mod2)
